@@ -1,35 +1,70 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from datetime import datetime, timedelta
-import uvicorn
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+from pymongo import MongoClient
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
-app = FastAPI()
-webhook_data = []
 
-@app.post("/webhook")
-async def webhook_listener(request: Request):
-    data = await request.json()
-    data["received_at"] = datetime.utcnow().isoformat()
 
-    # Avoid duplicates
-    if data not in webhook_data:
-        webhook_data.append(data)
+app = Flask(__name__)
+CORS(app)
+
+# Connect to MongoDB
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client['webhook_db']
+collection = db['events']
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    payload = request.json
+    event_type = request.headers.get('X-GitHub-Event')
+
+    data = {
+        'author': payload['sender']['login'],
+        'timestamp': datetime.utcnow(),
+        'action_type': event_type,
+        'from_branch': '',
+        'to_branch': '',
+    }
+
+    if event_type == 'push':
+        data['to_branch'] = payload['ref'].split('/')[-1]
+
+    elif event_type == 'pull_request':
+        data['from_branch'] = payload['pull_request']['head']['ref']
+        data['to_branch'] = payload['pull_request']['base']['ref']
+
+    elif event_type == 'merge':
+        # Optional - bonus if implemented
+        data['from_branch'] = payload['pull_request']['head']['ref']
+        data['to_branch'] = payload['pull_request']['base']['ref']
+
+    collection.insert_one(data)
+    return jsonify({"status": "received"}), 200
+
+@app.route('/events', methods=['GET'])
+def get_events():
+    events = list(collection.find().sort('timestamp', -1).limit(10))
+    formatted = []
+
+    for e in events:
+        timestamp = e['timestamp'].strftime("%-d %B %Y - %-I:%M %p UTC")
+        if e['action_type'] == 'push':
+            formatted.append(f'"{e["author"]}" pushed to "{e["to_branch"]}" on {timestamp}')
+        elif e['action_type'] == 'pull_request':
+            formatted.append(f'"{e["author"]}" submitted a pull request from "{e["from_branch"]}" to "{e["to_branch"]}" on {timestamp}')
+        elif e['action_type'] == 'merge':
+            formatted.append(f'"{e["author"]}" merged branch "{e["from_branch"]}" to "{e["to_branch"]}" on {timestamp}')
     
-    return {"message": "Received"}
+    return jsonify(formatted)
 
-@app.get("/", response_class=HTMLResponse)
-def show_data():
-    cutoff = datetime.utcnow() - timedelta(minutes=5)
-    filtered = [
-        item for item in webhook_data 
-        if datetime.fromisoformat(item["received_at"]) > cutoff
-    ]
-
-    html = "<h2>Webhook Data (last 5 mins)</h2><ul>"
-    for item in filtered:
-        html += f"<li>{item}</li>"
-    html += "</ul>"
-    return html
+@app.route('/')
+def home():
+    return render_template('index.html')
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
